@@ -1,7 +1,30 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-#### Image to Sphere Via Induced Represenations For Pose Estimation on PASCAL
+# # Image to Sphere Via Induced Represenations For Pose Estimation on PASCAL
+# 
+# This notebook introduces induced image to sphere (which we call Induced_I2S), for the orientation estimation step of single view pose prediction problems. Induced_I2S is based on the Image to Sphere (https://openreview.net/forum?id=_2bDpAtr7PI) architecture.
+# There are a few fundamental differences between I2S and Induced_I2S, which we enumerate here:
+# 1. Instead of the orthographic projection used in I2S, Induced_I2S uses a fully differentiable induction layer, which accepts a c-channeled image and outputs a set of matrix valued spherical harmonic coefficients. The orthographic projection is a specific instance of the induction layer. Unlike the orthographic projection, the induction layer creates a signal that has non-zero support everywhere on the sphere.
+# 
+# 2. The SO(3)-convolution is performed using the method of Saro et al. (https://arxiv.org/abs/2302.03655) which reduces the computational cost from L^{6} to L^{3} where L is the maximum total angular momentum. This signicantly reduces the computational cost of an SO(3) convolution.
+# 
+# 3. The is really no a priori reason why we need to induce from the plane to the sphere. We also use the induced representation to map directly from the plane into SO(3). Somewhat surprisingly, this is much more accurate then the image to sphere techniques.
+# 
+
+# Conceptual Questions:
+# To Do List:
+# 1. Conceptual question: What should s2 representation be? Re-read spherical CNN paper as this discusses choosing optimal convolutions
+# 2. Really need to include pyramid features to deal with discretization error. What is the best way to do this?
+# Specifically, we need to include both low resolution and high resolution discretization
+# 3. There is no obvious reason why the sphere is needed. Can potentially go directly to SO(3)
+
+# # Conceptual Questions: To Do List:
+# Conceptual question: What should s2 representation be? Re-read spherical CNN paper as this discusses choosing optimal convolutions
+# Really need to include pyramid features to deal with discretization error. What is the best way to do this? Specifically, we need to include both low resolution and high resolution discretization
+# There is no obvious reason why the sphere is needed. Can potentially go directly to SO(3)
+
+# In[7]:
 
 
 ### import relevent packages
@@ -34,7 +57,9 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 ### number of gpus avalible
 num_gpu = torch.cuda.device_count() 
+
 print("Number of GPUs avalible:", num_gpu )
+
 
 
 
@@ -209,6 +234,8 @@ class S2Conv(torch.nn.Module):
 
 
 # # SO(3) Convolution
+
+
 def so3_healpix_grid(rec_level: int=3):
     """Returns healpix grid over so3 of equally spaced rotations
    
@@ -327,13 +354,12 @@ class Induced_I2S(torch.nn.Module):
 
         #### suppose that output of SWIN is 768 trivial
         rep_in = 768 * [ SO2_act.irrep(0) ]
-        hidden_mulplicities_SO2 = { '0':768 }
 
         self.encoder = ImageEncoder()
 
+        hidden_mulplicities_SO2 = { '0':768 }
 
         ### the output mupliciteis of the induced SO3 layer
-        ### sphere fdim is 512 for orthographic projection in i2s
         mulplicities_SO3 = { '0' :1 , '1' :3 , '2' : 1 , '3': 1 , '4':1  , '5':1  }
 
         ##### the induction representation layer, 
@@ -349,12 +375,12 @@ class Induced_I2S(torch.nn.Module):
         ### THIS IS L_MAX - 1 !!! Need to standardize notations
         ### compute the dimension of s2 input features
         f_in = rep_ops.compute_SO3_dimension( mulplicities_SO3 )
-        self.s2_conv = S2Conv( f_in = f_in , f_out= 16 , lmax=self.lmax-1 , kernel_grid = s2_kernel_grid )
+        self.s2_conv = S2Conv( f_in = f_in , f_out= 205 , lmax=self.lmax-1 , kernel_grid = s2_kernel_grid )
 
         #### also L_max - 1 !!! Need to standardize notations
         so3_kernel_grid = so3_healpix_grid(rec_level=3)
         ### output is one dimensional so can use logits 
-        self.so3_conv = SO3Conv( f_in = 16 , f_out=1 , lmax=self.lmax-1 , kernel_grid = so3_kernel_grid )
+        self.so3_conv = SO3Conv( f_in = 205 , f_out=1 , lmax=self.lmax-1 , kernel_grid = so3_kernel_grid )
         self.so3_act = e3nn.nn.SO3Activation( self.lmax-1 , self.lmax-1 , act=torch.relu, resolution=20)
         
         output_xyx = so3_healpix_grid(rec_level=2)
@@ -413,7 +439,7 @@ class Induced_I2S(torch.nn.Module):
 
 
 ############ specifiy the arch
-lmax= 5
+lmax=7
 kmax= 20
 induced_arch = Induced_I2S( lmax=lmax , kmax = kmax )
 
@@ -426,12 +452,6 @@ try:
 
 except:
     print("No model found on file")
-
-### save model to file
-long_file = 'l_max_'+str(lmax)+'_'
-file = long_file + 'Encoded_Induced_I2S_SYMSOL.pt'
-torch.save( induced_arch.state_dict() , file)
-print("New Model saved to file")
 
 
 
@@ -585,9 +605,11 @@ train_dataloader = DataLoader( data_set, batch_size=train_batch_size, shuffle=Tr
 print("Deep Encoded Induced Train Batch Size:" , train_batch_size)
 
 # # Training the Induced_I2S Model
+
 ### Adam optimizer
 optimizer = torch.optim.Adam( induced_arch.parameters(), lr=0.03 )
 
+### three channels transforming in trivial rep
 cnt = 0
 num_epoch = 1
 for epoch in range(num_epoch):
@@ -597,23 +619,24 @@ for epoch in range(num_epoch):
         label = item['rot']
 
         optimizer.zero_grad()
+        #x = nn.GeometricTensor( img , feat_type_in  )
         x = img
 
         loss , a = induced_arch.compute_loss( x , label )
         loss.backward()
         optimizer.step()
 
-        ### print training loss
-        print( loss )
+        ### print model parameters
+        print(loss)
         sys.stdout.flush()
 
-        if (cnt%500 == 0 ):
+        if (cnt%100 == 0 ):
             long_file = 'l_max_'+str(lmax)+'_'
             file = long_file + 'Encoded_Induced_I2S_SYMSOL.pt'
             torch.save( induced_arch.state_dict() , file)
             print("Model Saved to file:", cnt)
             sys.stdout.flush()
-            cnt = cnt + 1
+        cnt = cnt + 1
 
 
 dataset_path = './'
@@ -634,14 +657,10 @@ with torch.no_grad():
         img = item['img']
         label = item['rot']
         x = img
-    
         loss , a = induced_arch.compute_loss( x , label )
 
         ### print model parameters
         print()
         print("Test Loss:" , loss )
         sys.stdout.flush()
-
-
-
 

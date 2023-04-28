@@ -1,28 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Image to Sphere Via Induced Represenations For Pose Estimation on SYMSOL
-# 
-# This notebook introduces induced image to sphere (which we call Induced_I2S), for the orientation estimation step of single view pose prediction problems. Induced_I2S is based on the Image to Sphere (https://openreview.net/forum?id=_2bDpAtr7PI) architecture.
-# There are a few fundamental differences between I2S and Induced_I2S, which we enumerate here:
-# 1. Instead of the orthographic projection used in I2S, Induced_I2S uses a fully differentiable induction layer, which accepts a c-channeled image and outputs a set of matrix valued spherical harmonic coefficients. The orthographic projection is a specific instance of the induction layer. Unlike the orthographic projection, the induction layer creates a signal that has non-zero support everywhere on the sphere.
-# 
-# 2. The SO(3)-convolution is performed using the method of Saro et al. (https://arxiv.org/abs/2302.03655) which reduces the computational cost from L^{6} to L^{3} where L is the maximum total angular momentum. This signicantly reduces the computational cost of an SO(3) convolution.
-# 
-# 3. The is really no a priori reason why we need to induce from the plane to the sphere. We also use the induced representation to map directly from the plane into SO(3). Somewhat surprisingly, this is much more accurate then the image to sphere techniques.
-# 
-
-# Conceptual Questions:
-# To Do List:
-# 1. Conceptual question: What should s2 representation be? Re-read spherical CNN paper as this discusses choosing optimal convolutions
-# 2. Really need to include pyramid features to deal with discretization error. What is the best way to do this?
-# Specifically, we need to include both low resolution and high resolution discretization
-# 3. There is no obvious reason why the sphere is needed. Can potentially go directly to SO(3)
-
-# # Conceptual Questions: To Do List:
-# Conceptual question: What should s2 representation be? Re-read spherical CNN paper as this discusses choosing optimal convolutions
-# Really need to include pyramid features to deal with discretization error. What is the best way to do this? Specifically, we need to include both low resolution and high resolution discretization
-# There is no obvious reason why the sphere is needed. Can potentially go directly to SO(3)
+# # Image to Sphere Via Induced Represenations For Pose Estimation on PASCAL
 
 
 ### import relevent packages
@@ -32,12 +11,11 @@ from e2cnn import gspaces
 from e2cnn import nn
 from e2cnn import group
 from e3nn import o3
-import torchvision
 import sys
 import e3nn
 import represenations_opps as rep_ops
 import healpy as hp
-
+import torchvision
 import time
 from torch.utils.data import Dataset
 from torch.utils.data import TensorDataset, DataLoader
@@ -48,6 +26,7 @@ import pickle
 
 # Check for Avalible GPUs
 
+# In[2]:
 
 
 ### check cuda read
@@ -65,9 +44,14 @@ print("Number of GPUs avalible:", num_gpu )
 #name = torch.cuda.get_device_name(0)
 #print(name)
 
+
+# # Defining an SO(2) Convolution Layer
+
+# In[3]:
+
+
 ### defining a SO2 convolution layer
 SO2_act = gspaces.Rot2dOnR2(N=-1,maximum_frequency=50)
-
 
 ### SWIN Image encoder
 class ImageEncoder(torch.nn.Module):
@@ -95,7 +79,6 @@ class ImageEncoder(torch.nn.Module):
 
     def forward(self, x):
         return self.layers(x)
-
 
 ### convert SO2 reps to e2cnn format
 ### This should be put in seperate script
@@ -196,7 +179,10 @@ class Image2SphereProjector(torch.nn.Module):
 
 
 # # Spherical Convolution
+# 
+# 
 
+# In[6]:
 
 
 ### Ask david if there is max beta that is optimal
@@ -363,14 +349,14 @@ class I2S(torch.nn.Module):
     ### Instantiate I2S-style network for predicting distributions over SO(3) from
     ### predictions made on single image using an induction layer 
     
-    def __init__(self, lmax=20 , kmax = 50 ):
+    def __init__(self, lmax=20 , kmax = 50  ):
         
         super().__init__()
         self.lmax = lmax
         self.kmax = kmax
-
+        
         ### no image encoder, can add this later
-        self.encoder = ImageEncoder()
+       	self.encoder = ImageEncoder()
 
         ### defining the SO2 action
         SO2_act = gspaces.Rot2dOnR2(N=-1,maximum_frequency=self.kmax)
@@ -381,6 +367,7 @@ class I2S(torch.nn.Module):
         ##### the induction representation layer, 
         ### compute the number of output channels of hidden rep
         channels_in = 768
+    
         self.img_params = 7
         self.proj = Image2SphereProjector( fmap_shape=(channels_in ,self.img_params ,self.img_params ), sphere_fdim= 512, lmax=self.lmax-1,
                coverage = 0.9,
@@ -416,9 +403,10 @@ class I2S(torch.nn.Module):
         ###'''Returns so3 irreps
         ###:x: the input image, tensor of shape (B, 1, image_size, image_size)
         ## x must be a geometric tensor
-       
+
+
         x = self.encoder(x)
-        x = self.proj( x )
+        x = self.proj( x)
         x = self.s2_conv( x )
         x = self.so3_act( x )
         x = self.so3_conv( x )
@@ -464,21 +452,24 @@ class I2S(torch.nn.Module):
 
 
 # In[10]:
-
-
 lmax=7
-standard_i2s = I2S( lmax=lmax , kmax = 50 )
+standard_i2s = I2S( lmax=lmax , kmax = 15 )
 
 #### see if there is loaded model
 try:
     long_file = 'l_max_'+str(lmax)+'_'
-    path = long_file + 'Encoded_Standard_I2S_SYMSOL.pt'
+    path = long_file + 'Encoder_Standard_I2S_PASCAL.pt'
     standard_i2s.load_state_dict( torch.load(path) )
     print("Model Loaded from file!")
 
 except:
     print("No model found on file")
 
+### save model to file
+long_file = 'l_max_'+str(lmax)+'_'
+file = long_file + 'Encoder_Standard_I2S_PASCAL.pt'
+torch.save( standard_i2s.state_dict() , file)
+print("Model saved to file")
 
 
 output_xyx = so3_healpix_grid(rec_level=3) # 37K points
@@ -559,10 +550,7 @@ def plot_so3_distribution(probs: torch.Tensor,
                  horizontalalignment='center',
                  verticalalignment='center', transform=ax.transAxes)
 
-    name = './graphs/name'
-    plt.savefig( name )
     plt.show()
-    plt.clf()
 
 
 # In[12]:
@@ -576,72 +564,23 @@ import torch
 import torchvision
 from PIL import Image
 
+import pascal_dataset as pascal_d
 
-class SymsolDataset(torch.utils.data.Dataset):
-    def __init__(self,
-                 dataset_path: str,
-                 train: bool,
-                 set_number: int=1,
-                 num_views: int=None,
-                ):
-        self.mode = 'train' if train else 'test'
-        self.path = os.path.join(dataset_path, "symsol", self.mode)
-        rotations_data = np.load(os.path.join(self.path, 'rotations.npz'))
-        self.class_names = {
-            1 : ('tet', 'cube', 'icosa', 'cone', 'cyl'),
-            2 : ('sphereX',),#, 'cylO', 'sphereX'),
-            3 : ('cylO',),#, 'cylO', 'sphereX'),
-            4 : ('tetX',),#, 'cylO', 'sphereX'),
-        }[set_number]
-        self.num_classes = len(self.class_names)
-
-        self.rotations_data = [rotations_data[c][:num_views] for c in self.class_names]
-        self.indexers = np.cumsum([len(v) for v in self.rotations_data])
-
-    def __getitem__(self, index):
-        cls_ind = np.argmax(index < self.indexers)
-        if cls_ind > 0:
-            index = index - self.indexers[cls_ind-1]
-
-        rot = self.rotations_data[cls_ind][index]
-        # randomly sample one of the valid rotation labels
-        rot = rot[np.random.randint(len(rot))]
-        rot = torch.from_numpy(rot)
-
-        im_path = os.path.join(self.path, 'images',
-                               f'{self.class_names[cls_ind]}_{str(index).zfill(5)}.png')
-        img = np.array(Image.open(im_path))
-        img = torch.from_numpy(img).to(torch.float32) / 255.
-        img = img.permute(2, 0, 1)
-
-        class_index = torch.tensor((cls_ind,), dtype=torch.long)
-
-        return dict(img=img, cls=class_index, rot=rot)
-
-    def __len__(self):
-        return self.indexers[-1]
-
-    @property
-    def img_shape(self):
-        return (3, 224, 224)
-
-dataset_path = './'
-batch_size = 5
-data_set = SymsolDataset( dataset_path , train = True , set_number=4   )
-train_dataloader = DataLoader( data_set, batch_size=batch_size, shuffle=True)
+train_batch_size = 7
+data_dir = './data/'
+data_set = pascal_d.Pascal3DReal( directory=data_dir  , train=True, img_size=224, use_warp=True)
+train_dataloader = DataLoader( data_set, batch_size=train_batch_size, shuffle=True)
 
 
-
-print( "Encoded Standard Train Batch Size:" , batch_size ) 
+print( "PASCAL Encoder Standard Train Batch Size:" , train_batch_size ) 
 sys.stdout.flush()
+
 
 
 ### Adam optimizer
 optimizer = torch.optim.Adam( standard_i2s.parameters(), lr=0.003 )
 
-### three channels transforming in trivial rep
-rep_in = 3*[ SO2_act.irrep(0) ]
-feat_type_in = nn.FieldType( SO2_act, rep_in  )
+
 
 cnt = 0
 num_epoch = 1
@@ -652,7 +591,7 @@ for epoch in range(num_epoch):
        label = item['rot']
 
        optimizer.zero_grad()
-       ### x = nn.GeometricTensor( img , feat_type_in  )
+       #x = nn.GeometricTensor( img , feat_type_in  )
        x = img
 
        loss , a = standard_i2s.compute_loss( x , label )
@@ -664,17 +603,32 @@ for epoch in range(num_epoch):
        sys.stdout.flush()    
        if (cnt%100 == 0 ):
            long_file = 'l_max_'+str(lmax)+'_'
-           file = long_file + 'Encoded_Standard_I2S_SYMSOL.pt'
+           file = long_file + 'Encoder_Standard_I2S_PASCAL.pt'
            torch.save( standard_i2s.state_dict() , file)
            print("Model Saved to file:", cnt)
            sys.stdout.flush()
        cnt = cnt + 1
 
 
+    # print()
+    # print('Epoch Number:' , epoch  )
+    # print("Training Loss:" , loss )
+    # print()
+    # sys.stdout.flush()
+    ### save model to file
+    long_file = 'l_max_'+str(lmax)+'_'
+    file = long_file + 'Encoder_Standard_I2S_PASCAL.pt'
+    torch.save( standard_i2s.state_dict() , file)
 
-dataset_path = './'
-test_data_set = SymsolDataset( dataset_path , train = False , set_number=4   )
-test_dataloader = DataLoader( test_data_set, batch_size=1, shuffle=True)
+
+
+test_batch_size = 7
+data_dir = './data/'
+test_data_set = pascal_d.Pascal3DReal( directory=data_dir  , train=False, img_size=224, use_warp=True)
+test_dataloader = DataLoader( test_data_set, batch_size=test_batch_size, shuffle=True)
+
+print("PASCAL Deep Induced Test Batch Size:" , test_batch_size)
+sys.stdout.flush()
 
 num_epoch = 1
 standard_i2s.eval()
@@ -684,9 +638,10 @@ with torch.no_grad():
        img = item['img']
        label = item['rot']
 
-       ###optimizer.zero_grad()
-       ##x = nn.GeometricTensor( img , feat_type_in  )
+       #optimizer.zero_grad()
+       #x = nn.GeometricTensor( img , feat_type_in  )
        x = img
+
        loss , a = standard_i2s.compute_loss( x , label )
        #loss.backward()
        #optimizer.step()
@@ -694,10 +649,7 @@ with torch.no_grad():
        sys.stdout.flush()
 
 
-       #y = induced_arch.forward(x)
-       #logits = torch.matmul(y, output_wigners).squeeze(1)
-       #probs = torch.nn.Softmax(dim=1)(logits)        
-       #plot_so3_distribution(probs[0], output_rotmats, gt_rotation=label)
+
 
 
 

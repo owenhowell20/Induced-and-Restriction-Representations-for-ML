@@ -1,54 +1,27 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Image to Sphere Via Induced Represenations For Pose Estimation on SYMSOL
-# 
-# This notebook introduces induced image to sphere (which we call Induced_I2S), for the orientation estimation step of single view pose prediction problems. Induced_I2S is based on the Image to Sphere (https://openreview.net/forum?id=_2bDpAtr7PI) architecture.
-# There are a few fundamental differences between I2S and Induced_I2S, which we enumerate here:
-# 1. Instead of the orthographic projection used in I2S, Induced_I2S uses a fully differentiable induction layer, which accepts a c-channeled image and outputs a set of matrix valued spherical harmonic coefficients. The orthographic projection is a specific instance of the induction layer. Unlike the orthographic projection, the induction layer creates a signal that has non-zero support everywhere on the sphere.
-# 
-# 2. The SO(3)-convolution is performed using the method of Saro et al. (https://arxiv.org/abs/2302.03655) which reduces the computational cost from L^{6} to L^{3} where L is the maximum total angular momentum. This signicantly reduces the computational cost of an SO(3) convolution.
-# 
-# 3. The is really no a priori reason why we need to induce from the plane to the sphere. We also use the induced representation to map directly from the plane into SO(3). Somewhat surprisingly, this is much more accurate then the image to sphere techniques.
-# 
-
-# Conceptual Questions:
-# To Do List:
-# 1. Conceptual question: What should s2 representation be? Re-read spherical CNN paper as this discusses choosing optimal convolutions
-# 2. Really need to include pyramid features to deal with discretization error. What is the best way to do this?
-# Specifically, we need to include both low resolution and high resolution discretization
-# 3. There is no obvious reason why the sphere is needed. Can potentially go directly to SO(3)
-
-# # Conceptual Questions: To Do List:
-# Conceptual question: What should s2 representation be? Re-read spherical CNN paper as this discusses choosing optimal convolutions
-# Really need to include pyramid features to deal with discretization error. What is the best way to do this? Specifically, we need to include both low resolution and high resolution discretization
-# There is no obvious reason why the sphere is needed. Can potentially go directly to SO(3)
+### Image to Sphere Via Induced Represenations For Pose Estimation on PASCAL
 
 
 ### import relevent packages
 import torch
+import sys
 import numpy as np
 from e2cnn import gspaces
 from e2cnn import nn
 from e2cnn import group
 from e3nn import o3
-import torchvision
-import sys
 import e3nn
 import represenations_opps as rep_ops
 import healpy as hp
-
+import torchvision
 import time
 from torch.utils.data import Dataset
 from torch.utils.data import TensorDataset, DataLoader
 
 ###import pickle5 as pickle
 import pickle
-
-
-# Check for Avalible GPUs
-
-
 
 ### check cuda read
 torch.cuda.is_available()
@@ -58,15 +31,23 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 ### number of gpus avalible
 num_gpu = torch.cuda.device_count() 
-
 print("Number of GPUs avalible:", num_gpu )
 
-### get names of gpus if avalible
-#name = torch.cuda.get_device_name(0)
-#print(name)
+
 
 ### defining a SO2 convolution layer
 SO2_act = gspaces.Rot2dOnR2(N=-1,maximum_frequency=50)
+
+
+### convert SO2 reps to e2cnn format
+### This should be put in seperate script
+def convert_SO2(  input_rep_dict ):
+    total_rep = []
+    for k in input_rep_dict.keys():
+        mulplicites = input_rep_dict[k]        
+        total_rep = total_rep + mulplicites * [SO2_act.irrep(int(k))]
+
+    return total_rep
 
 
 ### SWIN Image encoder
@@ -97,105 +78,176 @@ class ImageEncoder(torch.nn.Module):
         return self.layers(x)
 
 
-### convert SO2 reps to e2cnn format
-### This should be put in seperate script
-def convert_SO2(  input_rep_dict ):
-    total_rep = []
-    for k in input_rep_dict.keys():
-        mulplicites = input_rep_dict[k]        
-        total_rep = total_rep + mulplicites * [SO2_act.irrep(int(k))]
+# # Defining an SO(2) to SO(3) Induction Layer
+### The naive method: This is wayyyyy too slow
+### defining an induction layer from SO(2) to SO(3)
+class Induction_Layer_I(torch.nn.Module):
+    
+    ''' The Induction Layer is a Linear Layer that takes an SO2 represetation and outputs SO3 representations
+    For more details on the induction layer, please read the attached notes!
+    
+    Class Induction_Layer teturns matrix valued coefficients of spherical harmonics
+    :channels: Number of channels in image
+    :image_shape: integer, images must be square!!!
+    : kmax: maximum degree of so2 harmonics
+    :lmax: maximum degree of so3 harmonics
+    : rep_in  : input SO2 representation as dict
+    : rep_out : output SO3 representation as dict
+    
+    '''
 
-    return total_rep
-
-
-# # Image2Sphere Orthographic Projection Baseline
-def s2_healpix_grid(rec_level: int=0, max_beta: float=np.pi/6):
-    """Returns healpix grid up to a max_beta
-    """
-    n_side = 2**rec_level
-    npix = hp.nside2npix(n_side)
-    m = hp.query_disc(nside=n_side, vec=(0,0,1), radius=max_beta)
-    beta, alpha = hp.pix2ang(n_side, m)
-    alpha = torch.from_numpy(alpha)
-    beta = torch.from_numpy(beta)
-    return torch.stack((alpha, beta)).float()
-
-### image 2 sphere orthographic projection
-class Image2SphereProjector(torch.nn.Module):
-  
-    def __init__(self,
-               fmap_shape, 
-               sphere_fdim: int,
-               lmax: int,
-               coverage: float = 0.9,
-               sigma: float = 0.2,
-               max_beta: float = np.radians(90),
-               taper_beta: float = np.radians(75),
-               rec_level: int = 2,
-               n_subset: int = 20,
-              ):
-        super().__init__()
-        self.lmax = lmax
-        self.n_subset = n_subset
-
-        # point-wise linear operation to convert to proper dimensionality if needed
-        if fmap_shape[0] != sphere_fdim:
-          self.conv1x1 = torch.nn.Conv2d(fmap_shape[0], sphere_fdim, 1)
-        else:
-          self.conv1x1 = torch.nn.Identity()
-
-        # determine sampling locations for orthographic projection
-        self.kernel_grid = s2_healpix_grid(max_beta=max_beta, rec_level=rec_level)
-        self.xyz = o3.angles_to_xyz(*self.kernel_grid)
-
-        # orthographic projection
-        max_radius = torch.linalg.norm(self.xyz[:,[0,2]], dim=1).max()
-        sample_x = coverage * self.xyz[:,2] / max_radius # range -1 to 1
-        sample_y = coverage * self.xyz[:,0] / max_radius
-
-        gridx, gridy = torch.meshgrid(2*[torch.linspace(-1, 1, fmap_shape[1])], indexing='ij')
-        scale = 1 / np.sqrt(2 * np.pi * sigma**2)
-        data = scale * torch.exp(-((gridx.unsqueeze(-1) - sample_x).pow(2) \
-                                    +(gridy.unsqueeze(-1) - sample_y).pow(2)) / (2*sigma**2) )
-        data = data / data.sum((0,1), keepdims=True)
-
-        # apply mask to taper magnitude near border if desired
-        betas = self.kernel_grid[1]
-        if taper_beta < max_beta:
-            mask = ((betas - max_beta)/(taper_beta - max_beta)).clamp(max=1).view(1, 1, -1)
-        else:
-            mask = torch.ones_like(data)
-
-        data = (mask * data).unsqueeze(0).unsqueeze(0).to(torch.float32)
-        self.weight = torch.nn.Parameter(data= data, requires_grad=True)
-
-        self.n_pts = self.weight.shape[-1]
-        self.ind = torch.arange(self.n_pts)
-
-        self.register_buffer(
-            "Y", o3.spherical_harmonics_alpha_beta(range(lmax+1), *self.kernel_grid, normalization='component')
-        )
-
-    def forward(self, x):
-        '''
-        :x: float tensor of shape (B, C, H, W)
-        :return: feature vector of shape (B,P,C) where P is number of points on S2
-        '''
+    def __init__(self, channels:int , image_shape:int , k_max:int , L_max: int, dict_rep_in :dict , dict_rep_out:dict ):
         
-        #### x.tensor
-        x = self.conv1x1(x)
+        super().__init__()
+        self.k_max = k_max
+        self.lmax = L_max
+        self.channels = channels
+        self.image_shape = image_shape
+        
+        ### set of all convolutional parameters as a list
+        self.convs = torch.nn.ParameterList( [] )
+    
+        ### tensor product represenations as list
+        self.tensor_reps = []
+        
+        ### input and output representations as dict
+        self.dict_rep_in = dict_rep_in
+        self.dict_rep_out = dict_rep_out
+        
+        ### defining SO2 action
+        SO2_act = gspaces.Rot2dOnR2(N=-1,maximum_frequency=self.k_max)
+        
+        ### compute restriction of SO(3) output SO(2) representation
+        restrict = rep_ops.compute_restriction_SO3( self.dict_rep_out )
+        self.rep_out = convert_SO2(  restrict  )
+        
+        ### output feature types
+        self.feat_type_out = nn.FieldType( SO2_act, self.rep_out  )
+        
+        ### Defining tensor product features
+        for l in range( 0 , L_max + 1 ):
+            
+            tensor_rep_in = rep_ops.compute_tensor_SO2_l_fold( self.dict_rep_in , l )
+            
+            rep_in = convert_SO2( tensor_rep_in )
+            #print( tensor_rep_in )
+            #### compute the dimension of an so2 rep
+            d_v = rep_ops.compute_tensor_SO2_dimension( tensor_rep_in  )
+            
+            self.feat_type_in = nn.FieldType( SO2_act, rep_in  )
+                
+            conv = nn.R2Conv( self.feat_type_in, self.feat_type_out, kernel_size=self.image_shape)
+            self.convs.append( conv )   
 
-        if self.n_subset is not None:
-            self.ind = torch.randperm(self.n_pts)[:self.n_subset]
+            
+    def forward(self, x):
+        
+        ### convert x to a tensor if x is geometric tensor
+        x = x.tensor
+        
+        ### compute the l-th spherical harmonic matrix coeficent
+        l_coefs = []
+        for l in range( 0 ,  self.lmax  ):
+            
+            ## get filters
+            F_val = self.convs[l].expand_parameters()[0]
+            
+            l_k_coefs = []
+            for k in range(2*l+1):
+                
+                ### reformat to be same size
+                F_k = F_val[:,self.channels*k:self.channels*k + self.channels*1,:,:]
+                out = torch.einsum('ijkl , ajkl-> ai',  F_k , x )
+                l_k_coefs.append(out)
 
-        x = (x.unsqueeze(-1) * self.weight[..., self.ind]).sum((2,3))
-        x = torch.relu(x)
-        x = torch.einsum('ni,xyn->xyi', self.Y[self.ind], x) / self.ind.shape[0]**0.5
-        return x
+            
+            l_k_tensor = torch.stack( l_k_coefs )
+            #l_k_tensor = torch.einsum('ijk -> jki ', l_k_tensor )
+            
+            l_coefs.append( l_k_tensor )
+        
+        l_tensor = torch.cat(l_coefs,dim=0)
+        l_tensor = torch.einsum('ijk -> jki ', l_tensor )
+        
+        return l_tensor
 
 
 
-# # Spherical Convolution
+
+
+
+
+### Different approch, done using just matrix multiplications
+### This is also way too slow
+### defining an induction layer from SO(2) to SO(3)
+class Induction_Layer_III( torch.nn.Module ):
+    
+    ''' The Induction Layer is a Linear Layer that takes an SO2 represetation and outputs SO3 representations
+    For more details on the induction layer, please read the attached notes!
+    
+    Class Induction_Layer teturns matrix valued coefficients of spherical harmonics
+    :channels: Number of channels in image
+    :image_shape: integer, images must be square!!!
+    : kmax: maximum degree of so2 harmonics
+    :lmax: maximum degree of so3 harmonics
+    : rep_in  : input SO2 representation as dict
+    : rep_out : output SO3 representation as dict
+    
+    '''
+
+    def __init__(self, channels:int , image_shape:int , k_max:int , L_max: int, dict_rep_in :dict , dict_rep_out:dict ):
+        
+        super().__init__()
+        self.k_max = k_max
+        self.lmax = L_max
+        self.channels = channels
+        self.image_shape = image_shape
+        
+        ### tensor product represenations as list
+        self.tensor_reps = []
+        
+        ### input and output representations as dict
+        self.dict_rep_in = dict_rep_in
+        self.dict_rep_out = dict_rep_out
+        
+        ### defining SO2 action
+        SO2_act = gspaces.Rot2dOnR2(N=-1,maximum_frequency=self.k_max)
+        
+        ### compute restriction of SO(3) output SO(2) representation
+        restrict = rep_ops.compute_restriction_SO3( self.dict_rep_out )
+        self.rep_out = convert_SO2(  restrict  )
+        
+        ### output feature types
+        self.feat_type_out = nn.FieldType( SO2_act, self.rep_out  )
+        
+        
+        ### compute direct sum representation
+        total_rep = []
+        for l in range( 0 , L_max ):
+            
+            tensor_rep_in = rep_ops.compute_tensor_SO2_l_fold( self.dict_rep_in , l )
+            
+            rep_in = convert_SO2( tensor_rep_in )
+
+            
+            total_rep = total_rep + rep_in
+            
+        feat_type_in = nn.FieldType( SO2_act, total_rep  )
+            
+        self.conv = nn.R2Conv( feat_type_in , self.feat_type_out , kernel_size=self.image_shape)        
+        
+        
+            
+    def forward(self, x):
+                
+        F = self.conv.expand_parameters()[0]
+        F_val_cat = torch.split( F , split_size_or_sections= self.channels , dim=1)
+        g_split = torch.stack( F_val_cat ,dim=0 )
+            
+        ###now contract
+        y = torch.einsum('ijklm , aklm -> aji' ,  g_split , x )
+        
+        return y
 
 
 
@@ -221,7 +273,6 @@ def s2_irreps(lmax):
 
 def so3_irreps(lmax):
     return o3.Irreps([(2 * l + 1, (l, 1)) for l in range(lmax + 1)])
-
 
 
 ### defining convolution over sphere
@@ -252,8 +303,6 @@ class S2Conv(torch.nn.Module):
 
 
 # # SO(3) Convolution
-
-# In[7]:
 
 
 def so3_healpix_grid(rec_level: int=3):
@@ -314,10 +363,6 @@ class SO3Conv(torch.nn.Module):
 
 
 # # Loss functions
-
-# In[8]:
-
-
 def compute_trace(rotA, rotB):
     
     '''
@@ -352,53 +397,48 @@ def nearest_rotmat(src, target):
     return torch.max(trace, dim=1)[1]
 
 
-# # Defining the Standard I2S Network
-
-# In[9]:
-
-
-### I2S network
-class I2S(torch.nn.Module):
+### Induced_I2S network
+class Induced_I2S(torch.nn.Module):
     
     ### Instantiate I2S-style network for predicting distributions over SO(3) from
     ### predictions made on single image using an induction layer 
     
-    def __init__(self, lmax=20 , kmax = 50 ):
+    def __init__(self, lmax=20 , kmax = 20   ):
         
         super().__init__()
         self.lmax = lmax
         self.kmax = kmax
 
         ### no image encoder, can add this later
-        self.encoder = ImageEncoder()
+        ### self.encoder = ImageEncoder()
 
         ### defining the SO2 action
         SO2_act = gspaces.Rot2dOnR2(N=-1,maximum_frequency=self.kmax)
 
-        ### suppose that input is trival so2 rep
-        rep_in = 768*[ SO2_act.irrep(0) ]
+        #### suppose that output of SWIN is 768 trivial
+        rep_in = 768 * [ SO2_act.irrep(0) ]
+        hidden_mulplicities_SO2 = { '0':768 }
+
+        self.encoder = ImageEncoder()
+
+        ### the output mupliciteis of the induced SO3 layer
+        ### sphere fdim is 512 for orthographic projection in i2s
+        mulplicities_SO3 = { '0' :10 , '1' :10 , '2' :8 , '3':8  , '4':7  , '5':7   }
 
         ##### the induction representation layer, 
         ### compute the number of output channels of hidden rep
-        channels_in = 768
+        channels_in = 768 ###rep_ops.compute_SO2_dimension( hidden_mulplicities_SO2_3  )
         self.img_params = 7
-        self.proj = Image2SphereProjector( fmap_shape=(channels_in ,self.img_params ,self.img_params ), sphere_fdim= 512, lmax=self.lmax-1,
-               coverage = 0.9,
-               sigma = 0.2,
-               max_beta = np.radians(90),
-               taper_beta = np.radians(75),
-               rec_level = 2,
-               n_subset = 20 )
-        
-        
+        self.induce = Induction_Layer_III( channels = channels_in, image_shape= self.img_params , k_max =self.kmax, L_max=self.lmax , dict_rep_in = hidden_mulplicities_SO2 , dict_rep_out = mulplicities_SO3 )
+
         ### output format is: batch, number of output channels, number of input channels
         ### these are all in form of 
         s2_kernel_grid = s2_healpix_grid(max_beta=np.inf, rec_level=1)
 
         ### THIS IS L_MAX - 1 !!! Need to standardize notations
         ### compute the dimension of s2 input features
-        ### f_in = rep_ops.compute_SO3_dimension( mulplicities_SO3 )
-        self.s2_conv = S2Conv( f_in = 512 , f_out= 16 , lmax=self.lmax-1 , kernel_grid = s2_kernel_grid )
+        f_in = rep_ops.compute_SO3_dimension( mulplicities_SO3 )
+        self.s2_conv = S2Conv( f_in = f_in , f_out= 16 , lmax=self.lmax-1 , kernel_grid = s2_kernel_grid )
 
         #### also L_max - 1 !!! Need to standardize notations
         so3_kernel_grid = so3_healpix_grid(rec_level=3)
@@ -416,9 +456,9 @@ class I2S(torch.nn.Module):
         ###'''Returns so3 irreps
         ###:x: the input image, tensor of shape (B, 1, image_size, image_size)
         ## x must be a geometric tensor
-       
-        x = self.encoder(x)
-        x = self.proj( x )
+
+        x = self.encoder(x)    
+        x = self.induce( x )
         x = self.s2_conv( x )
         x = self.so3_act( x )
         x = self.so3_conv( x )
@@ -437,7 +477,6 @@ class I2S(torch.nn.Module):
         
         ### make sure output is long type tensor
         # x = x.tensor
-        
         grid_signal = torch.matmul(x, self.output_wigners ).squeeze(1)
         rotmats = self.output_rotmats
 
@@ -461,23 +500,26 @@ class I2S(torch.nn.Module):
         return torch.nn.Softmax(dim=1)(logits)
 
 
-
-
-# In[10]:
-
-
-lmax=7
-standard_i2s = I2S( lmax=lmax , kmax = 50 )
+############ specifiy the arch
+lmax=4
+induced_arch = Induced_I2S( lmax=lmax , kmax = 50  )
 
 #### see if there is loaded model
 try:
     long_file = 'l_max_'+str(lmax)+'_'
-    path = long_file + 'Encoded_Standard_I2S_SYMSOL.pt'
-    standard_i2s.load_state_dict( torch.load(path) )
+    path = long_file + 'Encoded_Induced_I2S_PASCAL.pt'
+    induced_arch.load_state_dict( torch.load(path) )
     print("Model Loaded from file!")
-
+    #model.eval()
 except:
     print("No model found on file")
+
+### save model to file
+long_file = 'l_max_'+str(lmax)+'_'
+file = long_file + 'Encoded_Induced_I2S_PASCAL.pt'
+torch.save( induced_arch.state_dict() , file)
+print("New Model saved to file")
+
 
 
 
@@ -486,7 +528,7 @@ output_wigners = flat_wigner( lmax - 1 , *output_xyx).transpose(0, 1)
 output_rotmats = o3.angles_to_matrix(*output_xyx)
 
 
-# In[11]:
+# In[19]:
 
 
 import matplotlib.pyplot as plt
@@ -559,13 +601,10 @@ def plot_so3_distribution(probs: torch.Tensor,
                  horizontalalignment='center',
                  verticalalignment='center', transform=ax.transAxes)
 
-    name = './graphs/name'
-    plt.savefig( name )
     plt.show()
-    plt.clf()
 
 
-# In[12]:
+# In[4]:
 
 
 from typing import Optional, List, Callable
@@ -576,130 +615,81 @@ import torch
 import torchvision
 from PIL import Image
 
+import pascal_dataset as pascal_d
 
-class SymsolDataset(torch.utils.data.Dataset):
-    def __init__(self,
-                 dataset_path: str,
-                 train: bool,
-                 set_number: int=1,
-                 num_views: int=None,
-                ):
-        self.mode = 'train' if train else 'test'
-        self.path = os.path.join(dataset_path, "symsol", self.mode)
-        rotations_data = np.load(os.path.join(self.path, 'rotations.npz'))
-        self.class_names = {
-            1 : ('tet', 'cube', 'icosa', 'cone', 'cyl'),
-            2 : ('sphereX',),#, 'cylO', 'sphereX'),
-            3 : ('cylO',),#, 'cylO', 'sphereX'),
-            4 : ('tetX',),#, 'cylO', 'sphereX'),
-        }[set_number]
-        self.num_classes = len(self.class_names)
-
-        self.rotations_data = [rotations_data[c][:num_views] for c in self.class_names]
-        self.indexers = np.cumsum([len(v) for v in self.rotations_data])
-
-    def __getitem__(self, index):
-        cls_ind = np.argmax(index < self.indexers)
-        if cls_ind > 0:
-            index = index - self.indexers[cls_ind-1]
-
-        rot = self.rotations_data[cls_ind][index]
-        # randomly sample one of the valid rotation labels
-        rot = rot[np.random.randint(len(rot))]
-        rot = torch.from_numpy(rot)
-
-        im_path = os.path.join(self.path, 'images',
-                               f'{self.class_names[cls_ind]}_{str(index).zfill(5)}.png')
-        img = np.array(Image.open(im_path))
-        img = torch.from_numpy(img).to(torch.float32) / 255.
-        img = img.permute(2, 0, 1)
-
-        class_index = torch.tensor((cls_ind,), dtype=torch.long)
-
-        return dict(img=img, cls=class_index, rot=rot)
-
-    def __len__(self):
-        return self.indexers[-1]
-
-    @property
-    def img_shape(self):
-        return (3, 224, 224)
-
-dataset_path = './'
-batch_size = 5
-data_set = SymsolDataset( dataset_path , train = True , set_number=4   )
-train_dataloader = DataLoader( data_set, batch_size=batch_size, shuffle=True)
+train_batch_size = 7
+data_dir = './data/'
+data_set = pascal_d.Pascal3DReal( directory=data_dir  , train=True, img_size=224, use_warp=True)
+train_dataloader = DataLoader( data_set, batch_size=train_batch_size, shuffle=True)
 
 
-
-print( "Encoded Standard Train Batch Size:" , batch_size ) 
+print("PASCAL Encoded Induced Train Batch Size:" , train_batch_size)
 sys.stdout.flush()
 
 
 ### Adam optimizer
-optimizer = torch.optim.Adam( standard_i2s.parameters(), lr=0.003 )
+optimizer = torch.optim.Adam( induced_arch.parameters(), lr=0.03 )
 
 ### three channels transforming in trivial rep
 rep_in = 3*[ SO2_act.irrep(0) ]
 feat_type_in = nn.FieldType( SO2_act, rep_in  )
-
 cnt = 0
 num_epoch = 1
 for epoch in range(num_epoch):
     for item in train_dataloader:
 
-       img = item['img']
-       label = item['rot']
+        img = item['img']
+        label = item['rot']
 
-       optimizer.zero_grad()
-       ### x = nn.GeometricTensor( img , feat_type_in  )
-       x = img
+        optimizer.zero_grad()
+        ### x = nn.GeometricTensor( img , feat_type_in  )
+        x = img
+        loss , a = induced_arch.compute_loss( x , label )
+        loss.backward()
+        optimizer.step()
 
-       loss , a = standard_i2s.compute_loss( x , label )
-       loss.backward()
-       optimizer.step()
+        ### print model parameters
+        print(loss)
+        sys.stdout.flush()
 
-    ### print model parameters
-       print(loss)
-       sys.stdout.flush()    
-       if (cnt%100 == 0 ):
-           long_file = 'l_max_'+str(lmax)+'_'
-           file = long_file + 'Encoded_Standard_I2S_SYMSOL.pt'
-           torch.save( standard_i2s.state_dict() , file)
-           print("Model Saved to file:", cnt)
-           sys.stdout.flush()
-       cnt = cnt + 1
+        if (cnt%400 == 0 ):
+            long_file = 'l_max_'+str(lmax)+'_'
+            file = long_file + 'Encoded_Induced_I2S_PASCAL.pt'
+            torch.save( induced_arch.state_dict() , file)
+            print("Model Saved to file:", cnt)
+            sys.stdout.flush()
+        cnt = cnt + 1
+
+    #print()
+    #print('Epoch Number:' , epoch  )
+    #print("Training Loss:" , loss )
+    #sys.stdout.flush()
 
 
 
-dataset_path = './'
-test_data_set = SymsolDataset( dataset_path , train = False , set_number=4   )
-test_dataloader = DataLoader( test_data_set, batch_size=1, shuffle=True)
+test_batch_size = 7
+data_dir = './data/'
+test_data_set = pascal_d.Pascal3DReal( directory=data_dir  , train=False, img_size=224, use_warp=True)
+test_dataloader = DataLoader( test_data_set, batch_size=test_batch_size, shuffle=True)        
 
+
+print("PASCAL Encoded Induced Test Batch Size:" , test_batch_size)
+sys.stdout.flush()
+
+### 1 test epoch
 num_epoch = 1
-standard_i2s.eval()
+induced_arch.eval()
 with torch.no_grad():
     for item in test_dataloader:
 
-       img = item['img']
-       label = item['rot']
+        img = item['img']
+        label = item['rot']
+        print(img.shape)
+        ### x = nn.GeometricTensor( img , feat_type_in  )
+        x = img
+        loss , a = induced_arch.compute_loss( x , label )
 
-       ###optimizer.zero_grad()
-       ##x = nn.GeometricTensor( img , feat_type_in  )
-       x = img
-       loss , a = standard_i2s.compute_loss( x , label )
-       #loss.backward()
-       #optimizer.step()
-       print("Test loss:", loss)
-       sys.stdout.flush()
-
-
-       #y = induced_arch.forward(x)
-       #logits = torch.matmul(y, output_wigners).squeeze(1)
-       #probs = torch.nn.Softmax(dim=1)(logits)        
-       #plot_so3_distribution(probs[0], output_rotmats, gt_rotation=label)
-
-
-
-
-
+        ### print model parameters
+        print()
+        print("Test Loss:" , loss )
+        sys.stdout.flush()
