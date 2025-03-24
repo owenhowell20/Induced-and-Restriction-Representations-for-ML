@@ -4,11 +4,14 @@ This is the code for constructing neural network layers between different groups
 
 
 
-@inproceedings{
-howell2023equivariant,
-title={Equivariant Single View Pose Prediction Via Induced and Restriction Representations},
-author={Owen Lewis Howell and David Klee and Ondrej Biza and Linfeng Zhao and Robin Walters},
-booktitle={Thirty-seventh Conference on Neural Information Processing Systems},
-year={2023},
-url={https://openreview.net/forum?id=dxVN2fZjx6}
+@inproceedings{NEURIPS2023_93b3d975,
+ author = {Howell, Owen and Klee, David and Biza, Ondrej and Zhao, Linfeng and Walters, Robin},
+ booktitle = {Advances in Neural Information Processing Systems},
+ editor = {A. Oh and T. Naumann and A. Globerson and K. Saenko and M. Hardt and S. Levine},
+ pages = {47251--47263},
+ publisher = {Curran Associates, Inc.},
+ title = {Equivariant Single View Pose Prediction Via Induced and Restriction Representations},
+ url = {https://proceedings.neurips.cc/paper_files/paper/2023/file/93b3d975f9a2448964a906199db98a9d-Paper-Conference.pdf},
+ volume = {36},
+ year = {2023}
 }
